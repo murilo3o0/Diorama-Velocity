@@ -586,7 +586,8 @@ public final class MapViewport {
 		float u1 = (float) ((startU + width * texel - originU) / span);
 		float v1 = (float) ((startV + height * texel - originV) / span);
 		var world = Minecraft.getInstance().level;
-		LayerKey key = new LayerKey(this.fogSerial, params, width, height, u0, v0, u1, v1, world == null ? 0 : world.getGameTime());
+		long gameTime = world == null ? 0 : world.getGameTime();
+		LayerKey key = new LayerKey(this.fogSerial, params, width, height, u0, v0, u1, v1, gameTime >> 2);
 		if (!key.equals(this.layerKey) || this.fogLayer.texture() == null) {
 			if (!this.fogLayer.render(canvas, this.maskTexture, FogTextures.noise(), this.detailTexture, width, height, u0, v0, u1, v1, params | LAYER_CODE << 24)) {
 				return false;
@@ -625,6 +626,7 @@ public final class MapViewport {
 	private long fogSerial;
 
 	private void buildMask(MapLevel level, View view, double originU, double originV, double texel, int scaleSteps, int fraction, boolean fast) {
+		boolean firstBuild = this.maskTexture == null;
 		if (this.maskTexture == null) {
 			this.maskTexture = MapTexture.create("diorama fog mask", MASK, 1);
 			this.detailTexture = MapTexture.create("diorama fog details", MASK, 1);
@@ -652,9 +654,8 @@ public final class MapViewport {
 				// The next starts once this one is in.
 				return;
 			}
-			// The view moved: what's being finished wouldn't line up, and its arrays are this build's.
-			this.finishing.join();
-			this.finishing = null;
+			// The view moved: let the current build finish, then replace it next frame.
+			return;
 		}
 		this.maskInputs = inputs;
 		this.maskLevel = new WeakReference<>(level);
@@ -786,7 +787,7 @@ public final class MapViewport {
 				Arrays.fill(this.remembered, 0);
 			}
 		}
-		this.finish(() -> this.finishBuild(inputs, rounded, surface), later);
+		this.finish(() -> this.finishBuild(inputs, rounded, surface), !firstBuild);
 	}
 
 	/**
@@ -1103,7 +1104,7 @@ public final class MapViewport {
 
 	public void close() {
 		if (this.finishing != null) {
-			// Its arrays are the next build's.
+			// Its arrays are the next build's; wait before releasing the viewport.
 			this.finishing.join();
 			this.finishing = null;
 		}
