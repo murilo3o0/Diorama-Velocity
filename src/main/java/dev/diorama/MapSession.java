@@ -16,7 +16,6 @@ import dev.diorama.waypoint.Portals;
 import dev.diorama.waypoint.WaypointStore;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -46,9 +45,9 @@ import org.jspecify.annotations.Nullable;
  */
 public final class MapSession {
 	/** Chunk light usually lands a moment after the blocks, so new chunks wait this long. */
-	private static final long LOAD_DELAY_MS = 750;
-	private static final long CHANGE_DELAY_MS = 250;
-	private static final int SNAPSHOTS_PER_TICK = 24;
+	private static final long LOAD_DELAY_MS = 900;
+	private static final long CHANGE_DELAY_MS = 500;
+	private static final int SNAPSHOTS_PER_TICK = 6;
 	/** How many blocks of rock above the player count as underground. A house roof is thinner. */
 	private static final int MIN_CAVE_DEPTH = 8;
 	/** How far up to look for open sky. */
@@ -567,7 +566,7 @@ public final class MapSession {
 	private void tickSession(Minecraft mc) {
 		this.updateSavedChunks(mc);
 		Entity viewer = viewer();
-		if (viewer != null && this.ticks++ % 40 == 0) {
+		if (viewer != null && this.ticks++ % 80 == 0) {
 			this.sweepLoadedChunks(viewer);
 		}
 		if (this.ticks % 600 == 0) {
@@ -594,16 +593,29 @@ public final class MapSession {
 				Portals.playerAt(at.getX(), at.getY(), at.getZ(), dimension, pins, this.map.world());
 			}
 		}
-		int budget = SNAPSHOTS_PER_TICK;
-		Iterator<Map.Entry<Long, Pending>> it = this.pending.entrySet().iterator();
-		while (it.hasNext() && budget > 0) {
-			Map.Entry<Long, Pending> entry = it.next();
-			Pending p = entry.getValue();
-			if (p.due > now) {
-				continue;
+		int budget = this.pending.size() > SNAPSHOTS_PER_TICK * 2 ? 2 : SNAPSHOTS_PER_TICK;
+		while (budget > 0) {
+			Map.Entry<Long, Pending> closest = null;
+			long closestDistance = Long.MAX_VALUE;
+			for (Map.Entry<Long, Pending> entry : this.pending.entrySet()) {
+				if (entry.getValue().due > now) {
+					continue;
+				}
+				long key = entry.getKey();
+				long dx = (int) (key >> 32) - (long) playerChunkX;
+				long dz = (int) key - (long) playerChunkZ;
+				long distance = dx * dx + dz * dz;
+				if (distance < closestDistance) {
+					closest = entry;
+					closestDistance = distance;
+				}
 			}
-			it.remove();
-			long key = entry.getKey();
+			if (closest == null) {
+				break;
+			}
+			this.pending.remove(closest.getKey());
+			Pending p = closest.getValue();
+			long key = closest.getKey();
 			int cx = (int) (key >> 32);
 			int cz = (int) key;
 			// Through Object: where getChunk already returns a LevelChunk, Java 17 (the 1.20.1 jar's)
