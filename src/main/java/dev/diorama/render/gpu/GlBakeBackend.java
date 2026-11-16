@@ -27,27 +27,13 @@ import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GLCapabilities;
 import org.lwjgl.system.MemoryStack;
 
-/**
- * Bakes with OpenGL 3.3 directly, for the versions whose own GPU layer can't express a bake (no
- * second colour target, half-float targets or per-instance data before 26.2). It owns
- * everything it touches: textures, framebuffers, vertex arrays, buffers and queries, and the
- * same shaders, compiled here rather than through vanilla's shader loading.
- *
- * <p>Vanilla keeps a copy of some GL state and skips calls its copy says are done, so that
- * state changes only through {@link GlState}; the rest is saved before a bake and put back
- * after. Pixels come back through pixel buffers with a fence, picked up by {@link #poll}.
- */
 final class GlBakeBackend implements BakeBackend {
 	private static final String[] ATTRIBUTES = {"Corner", "Cell", "Color", "Occlusion", "FaceLight", "SkyIndex", "Box", "Haze"};
-	/** Well clear of the binding points vanilla uses. */
 	private static final int UBO_BINDING = 30;
-	/** Texture units 0..5; vanilla's copy covers units 0..11. */
 	private static final int UNITS = 6;
-	// Also the LOC(n) macro 26.3's shaders define, which is spelled with a letter.
 	private static final Pattern LOCATION = Pattern.compile("layout\\(location = \\w+\\) ?");
 	private static final Pattern OUTPUT = Pattern.compile("layout\\(location = (\\d+)\\) out \\w+ (\\w+);");
 
-	/** Null until tried; then whether this GL can bake. */
 	private @Nullable Boolean usable;
 	private int skyProgram;
 	private int shadowProgram;
@@ -80,18 +66,55 @@ final class GlBakeBackend implements BakeBackend {
 	private int faceVbo;
 	private int casterVbo;
 	private int ubo;
+	private int faceVboCapacity;
+	private int casterVboCapacity;
 	private boolean timestamps;
 	private @Nullable String device;
-	/**
-	 * Up to 1.21.8 the game asks for OpenGL 3.2, so what the bake needs from 3.3 is looked for one
-	 * by one: drivers usually offer it anyway, or the extension it came from.
-	 */
 	private static boolean coreDivisor;
 	private static boolean samplerObjects;
-	private final ArrayDeque<Readback> readbacks = new ArrayDeque<>();
 
-	/** A bake's pixels on their way back. */
+	private final ArrayDeque<Readback> readbacks = new ArrayDeque<>();
+	private final ArrayDeque<Integer> colorPboPool = new ArrayDeque<>();
+	private final ArrayDeque<Integer> infoPboPool = new ArrayDeque<>();
+
 	private record Readback(GpuTileBaker.Job job, int colors, int info, long fence, int startQuery, int endQuery, long recordNanos) {
+	}
+
+	private int acquireColorPbo(int bytes) {
+		Integer pooled = this.colorPboPool.pollFirst();
+		int pbo = pooled != null ? pooled : glGenBuffers();
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+		if (pooled == null) {
+			glBufferData(GL_PIXEL_PACK_BUFFER, bytes, GL_STREAM_READ);
+		}
+		return pbo;
+	}
+
+	private int acquireInfoPbo(int bytes) {
+		Integer pooled = this.infoPboPool.pollFirst();
+		int pbo = pooled != null ? pooled : glGenBuffers();
+		glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+		if (pooled == null) {
+			glBufferData(GL_PIXEL_PACK_BUFFER, bytes, GL_STREAM_READ);
+		}
+		return pbo;
+	}
+
+	private void releasePbos(int colors, int info) {
+		if (colors != 0) {
+			if (this.colorPboPool.size() < 16) {
+				this.colorPboPool.addLast(colors);
+			} else {
+				glDeleteBuffers(colors);
+			}
+		}
+		if (info != 0) {
+			if (this.infoPboPool.size() < 16) {
+				this.infoPboPool.addLast(info);
+			} else {
+				glDeleteBuffers(info);
+			}
+		}
 	}
 
 	@Override
@@ -101,7 +124,6 @@ final class GlBakeBackend implements BakeBackend {
 		}
 		long start = System.nanoTime();
 		Saved saved = Saved.take();
-		// Made here and handed to the readback; deleted here if the draw fails before that.
 		int startQuery = 0;
 		int colors = 0;
 		int info = 0;
@@ -119,12 +141,29 @@ final class GlBakeBackend implements BakeBackend {
 			glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
 
 			glBindBuffer(GL_UNIFORM_BUFFER, this.ubo);
-			glBufferData(GL_UNIFORM_BUFFER, job.uniforms, GL_STREAM_DRAW);
+			glBufferData(GL_UNIFORM_BUFFER, GpuTileBaker.UBO_SIZE, GL_STREAM_DRAW);
+			glBufferSubData(GL_UNIFORM_BUFFER, 0, job.uniforms);
 			glBindBufferBase(GL_UNIFORM_BUFFER, UBO_BINDING, this.ubo);
+
+			int faceBytes = job.faces.remaining();
 			glBindBuffer(GL_ARRAY_BUFFER, this.faceVbo);
-			glBufferData(GL_ARRAY_BUFFER, job.faces, GL_STREAM_DRAW);
+			if (faceBytes > this.faceVboCapacity) {
+				this.faceVboCapacity = Math.max(faceBytes, this.faceVboCapacity * 2);
+			}
+			glBufferData(GL_ARRAY_BUFFER, this.faceVboCapacity, GL_STREAM_DRAW);
+			if (faceBytes > 0) {
+				glBufferSubData(GL_ARRAY_BUFFER, 0, job.faces);
+			}
+
+			int casterBytes = job.casters.remaining();
 			glBindBuffer(GL_ARRAY_BUFFER, this.casterVbo);
-			glBufferData(GL_ARRAY_BUFFER, job.casters, GL_STREAM_DRAW);
+			if (casterBytes > this.casterVboCapacity) {
+				this.casterVboCapacity = Math.max(casterBytes, this.casterVboCapacity * 2);
+			}
+			glBufferData(GL_ARRAY_BUFFER, this.casterVboCapacity, GL_STREAM_DRAW);
+			if (casterBytes > 0) {
+				glBufferSubData(GL_ARRAY_BUFFER, 0, job.casters);
+			}
 			GlState.forgetBuffers();
 
 			int skyFaces = job.opaqueCount + job.waterCount;
@@ -168,8 +207,6 @@ final class GlBakeBackend implements BakeBackend {
 				glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0, job.opaqueCount);
 			}
 
-			// Plants and glass, near to far: each adds its colour times what the ones in front let
-			// through (the target's alpha), and lets through less behind it.
 			this.target(this.tintFbo, SCENE, SCENE);
 			this.clearColor(0, 0, 0, 0, 1);
 			if (job.tintedCount > 0) {
@@ -200,19 +237,14 @@ final class GlBakeBackend implements BakeBackend {
 			GlState.bindVertexArray(this.emptyVao);
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 
-			// Into pixel buffers; the fence says when they're there.
 			GlState.bindFramebuffer(GL_READ_FRAMEBUFFER, this.outputFbo);
-			colors = glGenBuffers();
-			glBindBuffer(GL_PIXEL_PACK_BUFFER, colors);
-			glBufferData(GL_PIXEL_PACK_BUFFER, (long) size * size * 4, GL_STREAM_READ);
+			colors = this.acquireColorPbo(size * size * 4);
 			Saved.plainPixelStore();
 			glReadBuffer(GL_COLOR_ATTACHMENT0);
 			glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, 0L);
-			// Overlay bits in red, the sky view's block light in green.
+
 			if (job.mesh.overlays != null || !job.mesh.lit) {
-				info = glGenBuffers();
-				glBindBuffer(GL_PIXEL_PACK_BUFFER, info);
-				glBufferData(GL_PIXEL_PACK_BUFFER, (long) size * size * 2, GL_STREAM_READ);
+				info = this.acquireInfoPbo(size * size * 2);
 				glPixelStorei(GL_PACK_ALIGNMENT, 1);
 				glReadBuffer(GL_COLOR_ATTACHMENT1);
 				glReadPixels(0, 0, size, size, GL_RG, GL_UNSIGNED_BYTE, 0L);
@@ -230,11 +262,7 @@ final class GlBakeBackend implements BakeBackend {
 			GpuTileBaker.recorded(recordNanos);
 		} finally {
 			if (!queued) {
-				for (int buffer : new int[] {colors, info}) {
-					if (buffer != 0) {
-						glDeleteBuffers(buffer);
-					}
-				}
+				this.releasePbos(colors, info);
 				for (int query : new int[] {startQuery, endQuery}) {
 					if (query != 0) {
 						glDeleteQueries(query);
@@ -261,8 +289,9 @@ final class GlBakeBackend implements BakeBackend {
 			return;
 		}
 		int pack = glGetInteger(GL_PIXEL_PACK_BUFFER_BINDING);
+		int processed = 0;
 		try {
-			while (!this.readbacks.isEmpty()) {
+			while (!this.readbacks.isEmpty() && processed < 2) {
 				Readback r = this.readbacks.peek();
 				int status = glClientWaitSync(r.fence, 0, 0);
 				if (status == GL_TIMEOUT_EXPIRED) {
@@ -304,6 +333,7 @@ final class GlBakeBackend implements BakeBackend {
 						gpu = glGetQueryObjecti64(r.endQuery, GL_QUERY_RESULT) - glGetQueryObjecti64(r.startQuery, GL_QUERY_RESULT);
 					}
 					r.job.done(pixels, info, light, r.recordNanos, gpu);
+					processed++;
 				} catch (Throwable t) {
 					Diorama.LOGGER.error("Reading back GPU tile {} failed", r.job.mesh.key, t);
 					r.job.fail();
@@ -317,17 +347,13 @@ final class GlBakeBackend implements BakeBackend {
 	}
 
 	private void free(Readback r) {
-		glDeleteBuffers(r.colors);
-		if (r.info != 0) {
-			glDeleteBuffers(r.info);
-		}
+		this.releasePbos(r.colors, r.info);
 		if (r.startQuery != 0) {
 			glDeleteQueries(r.startQuery);
 			glDeleteQueries(r.endQuery);
 		}
 	}
 
-	/** Points the face instance attributes at the faces from {@code first} on. */
 	private void pointFaces(int first) {
 		long offset = (long) first * FACE_BYTES;
 		glBindBuffer(GL_ARRAY_BUFFER, this.faceVbo);
@@ -345,7 +371,6 @@ final class GlBakeBackend implements BakeBackend {
 		GlState.viewport(width, height);
 	}
 
-	/** Depth tested the way vanilla does, reversed: nearer is larger. */
 	private void depth(boolean write) {
 		GlState.depthTest(true);
 		GlState.depthFunc(GL_GEQUAL);
@@ -365,7 +390,6 @@ final class GlBakeBackend implements BakeBackend {
 		}
 	}
 
-	/** Binds textures to units 0, 1, ... in order, with no sampler object overriding them. */
 	private void bindTextures(int... textures) {
 		for (int i = 0; i < textures.length; i++) {
 			GlState.activeTexture(i);
@@ -387,9 +411,6 @@ final class GlBakeBackend implements BakeBackend {
 				samplerObjects = caps.glBindSampler != 0;
 				this.timestamps = caps.glQueryCounter != 0 && caps.glGetQueryObjecti64v != 0;
 				Diorama.LOGGER.info("GPU baking on {}", this.device());
-				// An error stays flagged until someone reads it, and on Windows nothing in the game
-				// does, so one another mod raised minutes ago would be blamed on this setup. Read
-				// them away first; GL keeps one per kind, so a few reads clear them all.
 				int error;
 				for (int i = 0; i < 16 && (error = glGetError()) != GL_NO_ERROR; i++) {
 					Diorama.LOGGER.debug("OpenGL error {} was flagged before GPU baking set up; not counting it", error);
@@ -409,7 +430,6 @@ final class GlBakeBackend implements BakeBackend {
 	}
 
 	private void create(GLCapabilities caps) throws IOException {
-		// The game may run OpenGL with depth from 0 to 1, as 26.3 does; the shaders need to know.
 		boolean zeroToOne = (caps.OpenGL45 || caps.GL_ARB_clip_control) && glGetInteger(0x935D) == 0x935F;
 		String depth = zeroToOne ? "DIORAMA_DEPTH_ZERO_TO_ONE" : null;
 		String vsh = shader("core/bake.vsh");
@@ -417,10 +437,8 @@ final class GlBakeBackend implements BakeBackend {
 		this.skyProgram = program(vsh, fsh, Map.of("Voxels", 0), "SKY_PASS", depth);
 		this.shadowProgram = program(vsh, fsh, Map.of(), "SHADOW", depth);
 		Map<String, Integer> faces = Map.of("ShadowMap", 0, "Sky", 1);
-		// Under a roof the voxels too, for the shadows the shadow map misses.
 		this.opaqueProgram = program(vsh, fsh, Map.of("ShadowMap", 0, "Sky", 1, "Voxels", 2), null, depth);
 		this.tintedProgram = program(vsh, fsh, faces, "TINTED", depth);
-		// The voxels stay bound on unit 2 from the opaque pass.
 		this.waterProgram = program(vsh, fsh, Map.of("ShadowMap", 0, "Sky", 1, "Voxels", 2), "WATER", depth);
 		Map<String, Integer> composite = new LinkedHashMap<>();
 		String[] names = {"SceneColor", "SceneDepth", "SceneAux", "Tint", "WaterColor", "WaterDepth"};
@@ -452,10 +470,11 @@ final class GlBakeBackend implements BakeBackend {
 		this.ubo = glGenBuffers();
 		this.faceVbo = glGenBuffers();
 		this.casterVbo = glGenBuffers();
+		this.faceVboCapacity = 256 * 1024;
+		this.casterVboCapacity = 64 * 1024;
 		this.cornerVbo = glGenBuffers();
 		glBindBuffer(GL_ARRAY_BUFFER, this.cornerVbo);
 		try (MemoryStack stack = MemoryStack.stackPush()) {
-			// (0,0), (1,0), (1,1), (0,1): round the quad, as the indices below expect.
 			glBufferData(GL_ARRAY_BUFFER, stack.bytes((byte) 0, (byte) 0, (byte) 0, (byte) 0, (byte) 255, (byte) 0, (byte) 0, (byte) 0,
 				(byte) 255, (byte) 255, (byte) 0, (byte) 0, (byte) 0, (byte) 255, (byte) 0, (byte) 0), GL_STATIC_DRAW);
 			this.indexBuffer = glGenBuffers();
@@ -497,14 +516,12 @@ final class GlBakeBackend implements BakeBackend {
 		}
 	}
 
-	/** Leaves the unit's texture to sample with its own settings; vanilla binds sampler objects from 1.21.11. */
 	private static void noSampler(int unit) {
 		if (samplerObjects) {
 			glBindSampler(unit, 0);
 		}
 	}
 
-	/** Attribute 0 of the bound vertex array: the quad corner, from the corner buffer. */
 	private void corners() {
 		glBindBuffer(GL_ARRAY_BUFFER, this.cornerVbo);
 		glEnableVertexAttribArray(0);
@@ -521,13 +538,11 @@ final class GlBakeBackend implements BakeBackend {
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-		// Depth textures are read as plain values, not compared.
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
 		glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, width, height, 0, format, type, (ByteBuffer) null);
 		return texture;
 	}
 
-	/** A framebuffer over a depth texture (0 for none) and colour textures in attachment order. */
 	private static int framebuffer(int depth, int... colors) {
 		int fbo = glGenFramebuffers();
 		GlState.bindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -552,11 +567,6 @@ final class GlBakeBackend implements BakeBackend {
 		return fbo;
 	}
 
-	/**
-	 * A shader from the mod's jar with its include put in place. Block comments go first: the
-	 * other version's lines can sit in one, and so can an include line that mustn't be expanded.
-	 * A line commented out with {@code //} stays put, as only a directive starting its line counts.
-	 */
 	private static String shader(String name) throws IOException {
 		String text = BLOCK_COMMENT.matcher(read("/assets/diorama/shaders/" + name)).replaceAll("");
 		String include = java.util.regex.Matcher.quoteReplacement(BLOCK_COMMENT.matcher(read("/assets/diorama/shaders/include/bake.glsl")).replaceAll(""));
@@ -575,11 +585,6 @@ final class GlBakeBackend implements BakeBackend {
 		}
 	}
 
-	/**
-	 * Compiles and links a program. Inputs and outputs are bound by name here, so the explicit
-	 * locations 26.3's shaders carry are taken out; the uniform block and samplers get their
-	 * binding and units.
-	 */
 	private static int program(String vsh, String fsh, Map<String, Integer> samplers, @Nullable String define, @Nullable String depth) {
 		Map<String, Integer> outputs = new LinkedHashMap<>();
 		Matcher m = OUTPUT.matcher(fsh);
@@ -622,11 +627,6 @@ final class GlBakeBackend implements BakeBackend {
 		return program;
 	}
 
-	/**
-	 * The pass's defines after the version line; no explicit locations; the vertex index under its GL name.
-	 * GLSL 1.50, what OpenGL 3.2 promises: up to 1.21.8 the game asks for no more, and with explicit
-	 * locations gone the shaders need nothing newer.
-	 */
 	private static String prepare(String source, String defines) {
 		String text = LOCATION.matcher(source).replaceAll("")
 			.replace("#version 330", "#version 150")
@@ -648,17 +648,11 @@ final class GlBakeBackend implements BakeBackend {
 		return shader;
 	}
 
-	/**
-	 * The GL state a bake changes, taken before and put back after. What vanilla keeps a copy of
-	 * goes back through {@link GlState}, so the copy stays true too: vanilla can rely on state it
-	 * set before the frame hook (culling, before 1.21.5) without setting it again.
-	 */
 	private record Saved(
 		int program, int vao, int arrayBuffer, int uniformBuffer, int uboBinding, int pack, int unpack, int drawFbo, int readFbo,
 		int[] viewport, int activeTexture, int[] textures, int[] samplers, int[] pixelStore,
 		boolean cull, boolean scissor, boolean depthTest, int depthFunc, boolean depthMask, boolean blend0, boolean blend1, int[] blendFunc, boolean[] colorMask
 	) {
-		/** Pixel store settings a bake sets: pack and unpack alignment, row length and skips. */
 		private static final int[] PIXEL_STORE = {
 			GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH, GL_PACK_SKIP_PIXELS, GL_PACK_SKIP_ROWS,
 			GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_PIXELS, GL_UNPACK_SKIP_ROWS
@@ -701,7 +695,6 @@ final class GlBakeBackend implements BakeBackend {
 			);
 		}
 
-		/** Packed and unpacked rows start at the buffer's start and run on unbroken: what a bake's buffers are. */
 		static void plainPixelStore() {
 			for (int i = 0; i < PIXEL_STORE.length; i++) {
 				int name = PIXEL_STORE[i];
